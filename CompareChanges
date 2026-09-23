@@ -1,0 +1,1220 @@
+Option Explicit
+
+'==================================================================================
+' MODULE: CompareChanges
+' PURPOSE: Compare local Sheet(1) data with network file Sheet(1) data.
+'          Produces a report on a "Changes" sheet.
+'          Does NOT modify the main sheet or the network file in any way.
+'
+' CHANGES SHEET STRUCTURE:
+'   Column A = Select
+'   Column B = Change Type
+'   Column C onward = Original data columns
+'   After original data columns:
+'       Changed By
+'       Time
+'       Date
+'
+' Select values:
+'   NO  = Do not update this record
+'   YES = Update this record
+'
+' Change Type:
+'   Modified
+'   Added
+'   Deleted
+'
+' HOW TO USE:
+'   1. Paste this complete code into a standard VBA Module.
+'   2. Run Sub CompareChanges_Run
+'==================================================================================
+
+' ---------------------------------------------------------------------------------
+' CONFIGURATION
+' ---------------------------------------------------------------------------------
+
+Private Const NETWORK_FILE_PATH As String = "Y:\Drawing Factories\Drawing List Factories-NEW.xlsm"
+
+Private Const MAIN_SHEET_INDEX As Long = 1
+Private Const NETWORK_SHEET_INDEX As Long = 1
+Private Const CHANGES_SHEET_NAME As String = "Changes"
+
+' Row where the actual column headers live.
+Private Const HEADER_ROW As Long = 2
+
+Private Const KEY_COL_NAME_1 As String = "REQUEST"
+Private Const KEY_COL_NAME_2 As String = "NUMBER"
+
+' Extra metadata columns appended after the data columns
+Private Const EXTRA_COL_COUNT As Long = 3
+
+Private Const HEADER_CHANGED_BY As String = "Changed By"
+Private Const HEADER_TIME As String = "Time"
+Private Const HEADER_DATE As String = "Date"
+
+' Changes sheet control columns
+Private Const SELECT_COL As Long = 1
+Private Const CHANGE_TYPE_COL As Long = 2
+Private Const DATA_START_COL As Long = 3
+
+Private Const HEADER_SELECT As String = "Select"
+Private Const HEADER_CHANGE_TYPE As String = "Change Type"
+
+' Colors
+Private Const COLOR_MODIFIED As Long = 65535       ' Yellow
+Private Const COLOR_ADDED As Long = 5296274        ' Green
+Private Const COLOR_DELETED As Long = 255           ' Red
+
+' ---------------------------------------------------------------------------------
+' MAIN ENTRY POINT
+' ---------------------------------------------------------------------------------
+
+Sub CompareChanges_Run()
+
+    Dim wbMain As Workbook
+    Dim wbNetwork As Workbook
+
+    Dim wsMain As Worksheet
+    Dim wsNetwork As Worksheet
+    Dim wsChanges As Worksheet
+
+    Dim arrOld As Variant
+    Dim arrNew As Variant
+
+    Dim dictOld As Object
+    Dim dictNew As Object
+
+    Dim headers() As Variant
+
+    Dim colCount As Long
+    Dim keyColRequest As Long
+    Dim keyColNumber As Long
+
+    Dim countModified As Long
+    Dim countAdded As Long
+    Dim countDeleted As Long
+
+    Dim changeAuthor As String
+    Dim changeDateTime As Date
+
+    Dim originalScreenUpdating As Boolean
+    Dim originalEnableEvents As Boolean
+    Dim originalCalculation As XlCalculation
+    Dim originalDisplayAlerts As Boolean
+
+    Dim networkOpenedHere As Boolean
+    networkOpenedHere = False
+
+    Dim CurrentStep As String
+    CurrentStep = "Initializing"
+
+    On Error GoTo ErrorHandler
+
+    ' -------------------------------------------------------------------------
+    ' Save current Excel application state
+    ' -------------------------------------------------------------------------
+
+    originalScreenUpdating = Application.ScreenUpdating
+    originalEnableEvents = Application.EnableEvents
+    originalCalculation = Application.Calculation
+    originalDisplayAlerts = Application.DisplayAlerts
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.DisplayAlerts = False
+
+    ' -------------------------------------------------------------------------
+    ' Main workbook / sheet
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Getting main workbook and sheet"
+
+    Set wbMain = ThisWorkbook
+    Set wsMain = wbMain.Sheets(MAIN_SHEET_INDEX)
+
+    ' -------------------------------------------------------------------------
+    ' Validate network file
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Validating network path"
+
+    Dim cleanPath As String
+    cleanPath = Trim(NETWORK_FILE_PATH)
+
+    If cleanPath <> NETWORK_FILE_PATH Then
+
+        MsgBox "Warning: the network path constant has leading/trailing spaces." & vbCrLf & _
+               "Original length: " & Len(NETWORK_FILE_PATH) & vbCrLf & _
+               "Trimmed length: " & Len(cleanPath), _
+               vbExclamation, _
+               "Path Warning"
+
+    End If
+
+    CurrentStep = "Checking network file exists"
+
+    If Dir(cleanPath) = "" Then
+
+        MsgBox "Network file not found or not accessible:" & vbCrLf & _
+               cleanPath & vbCrLf & vbCrLf & _
+               "Check that:" & vbCrLf & _
+               "- The network share is reachable." & vbCrLf & _
+               "- You have Read permission." & vbCrLf & _
+               "- The path has no typo.", _
+               vbCritical, _
+               "File Not Found"
+
+        GoTo CleanExit
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' Open network workbook as ReadOnly
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Opening network file"
+
+    Set wbNetwork = Workbooks.Open( _
+                        Filename:=cleanPath, _
+                        UpdateLinks:=0, _
+                        ReadOnly:=True, _
+                        IgnoreReadOnlyRecommended:=True, _
+                        Notify:=False)
+
+    networkOpenedHere = True
+
+    CurrentStep = "Getting network sheet"
+
+    Set wsNetwork = wbNetwork.Sheets(NETWORK_SHEET_INDEX)
+
+    ' -------------------------------------------------------------------------
+    ' Get network file author and last modification date
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Reading network file information"
+
+    On Error Resume Next
+
+    changeAuthor = wbNetwork.BuiltinDocumentProperties("Last Author")
+
+    On Error GoTo ErrorHandler
+
+    If Len(Trim(changeAuthor)) = 0 Then
+        changeAuthor = "Unknown"
+    End If
+
+    changeDateTime = FileDateTime(cleanPath)
+
+    ' -------------------------------------------------------------------------
+    ' Read headers from main sheet
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Reading headers from main sheet"
+
+    colCount = wsMain.Cells(HEADER_ROW, wsMain.Columns.Count).End(xlToLeft).Column
+
+    headers = wsMain.Range( _
+                    wsMain.Cells(HEADER_ROW, 1), _
+                    wsMain.Cells(HEADER_ROW, colCount) _
+              ).value
+
+    ' -------------------------------------------------------------------------
+    ' Find key columns
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Locating key columns"
+
+    keyColRequest = FindColumnByHeader(headers, KEY_COL_NAME_1)
+    keyColNumber = FindColumnByHeader(headers, KEY_COL_NAME_2)
+
+    If keyColRequest = 0 Or keyColNumber = 0 Then
+
+        MsgBox "Key columns REQUEST and/or NUMBER were not found in the header row.", _
+               vbCritical, _
+               "Missing Key Columns"
+
+        GoTo CleanExit
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' Read main workbook data
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Reading main sheet data"
+
+    arrOld = ReadSheetToArray(wsMain)
+
+    ' -------------------------------------------------------------------------
+    ' Read network workbook data
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Reading network sheet data"
+
+    arrNew = ReadSheetToArray(wsNetwork)
+
+    ' -------------------------------------------------------------------------
+    ' Build dictionaries
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Building dictionary for main data"
+
+    Set dictOld = BuildKeyDictionary( _
+                        arrOld, _
+                        keyColRequest, _
+                        keyColNumber)
+
+    CurrentStep = "Building dictionary for network data"
+
+    Set dictNew = BuildKeyDictionary( _
+                        arrNew, _
+                        keyColRequest, _
+                        keyColNumber)
+
+    ' -------------------------------------------------------------------------
+    ' Prepare Changes sheet
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Preparing Changes sheet"
+
+    Set wsChanges = PrepareChangesSheet( _
+                            wbMain, _
+                            headers, _
+                            colCount)
+
+    ' -------------------------------------------------------------------------
+    ' Compare and write report
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Comparing and writing report"
+
+    WriteComparisonReport _
+        wsChanges, _
+        arrOld, _
+        arrNew, _
+        dictOld, _
+        dictNew, _
+        colCount, _
+        changeAuthor, _
+        changeDateTime, _
+        countModified, _
+        countAdded, _
+        countDeleted
+
+    ' -------------------------------------------------------------------------
+    ' Close network file
+    ' -------------------------------------------------------------------------
+
+    CurrentStep = "Closing network file"
+
+    wbNetwork.Close SaveChanges:=False
+    networkOpenedHere = False
+
+    ' -------------------------------------------------------------------------
+    ' Final message
+    ' -------------------------------------------------------------------------
+
+    MsgBox "Comparison completed." & vbCrLf & vbCrLf & _
+           "Modified: " & countModified & vbCrLf & _
+           "Added: " & countAdded & vbCrLf & _
+           "Deleted: " & countDeleted & vbCrLf & vbCrLf & _
+           "All records were initially set to Select = NO.", _
+           vbInformation, _
+           "Comparison Result"
+
+CleanExit:
+
+    ' Restore Excel state
+    Application.ScreenUpdating = originalScreenUpdating
+    Application.EnableEvents = originalEnableEvents
+    Application.Calculation = originalCalculation
+    Application.DisplayAlerts = originalDisplayAlerts
+
+    Exit Sub
+
+ErrorHandler:
+
+    If networkOpenedHere Then
+
+        On Error Resume Next
+
+        wbNetwork.Close SaveChanges:=False
+
+        On Error GoTo 0
+
+    End If
+
+    MsgBox "An error occurred at step:" & vbCrLf & _
+           CurrentStep & vbCrLf & vbCrLf & _
+           "Error " & Err.Number & ": " & Err.Description, _
+           vbCritical, _
+           "Error"
+
+    Resume CleanExit
+
+End Sub
+
+' ---------------------------------------------------------------------------------
+' Find a column index in headers array by header name
+' ---------------------------------------------------------------------------------
+
+Private Function FindColumnByHeader( _
+                    headers As Variant, _
+                    headerName As String) As Long
+
+    Dim i As Long
+
+    FindColumnByHeader = 0
+
+    For i = LBound(headers, 2) To UBound(headers, 2)
+
+        If StrComp( _
+                Trim(CStr(headers(1, i))), _
+                headerName, _
+                vbTextCompare) = 0 Then
+
+            FindColumnByHeader = i
+
+            Exit Function
+
+        End If
+
+    Next i
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Read worksheet data into array
+' ---------------------------------------------------------------------------------
+
+Private Function ReadSheetToArray(ws As Worksheet) As Variant
+
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim firstDataRow As Long
+
+    firstDataRow = HEADER_ROW + 1
+
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    lastCol = ws.Cells( _
+                    HEADER_ROW, _
+                    ws.Columns.Count).End(xlToLeft).Column
+
+    If lastRow < firstDataRow Then
+
+        ReadSheetToArray = Empty
+
+        Exit Function
+
+    End If
+
+    ReadSheetToArray = ws.Range( _
+                            ws.Cells(firstDataRow, 1), _
+                            ws.Cells(lastRow, lastCol) _
+                        ).value
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Build Dictionary
+'
+' Key:
+'     REQUEST|NUMBER
+'
+' Value:
+'     Row index in array
+' ---------------------------------------------------------------------------------
+
+Private Function BuildKeyDictionary( _
+                    arr As Variant, _
+                    keyColRequest As Long, _
+                    keyColNumber As Long) As Object
+
+    Dim dict As Object
+
+    Dim i As Long
+    Dim key As String
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    dict.CompareMode = vbTextCompare
+
+    If IsEmpty(arr) Then
+
+        Set BuildKeyDictionary = dict
+
+        Exit Function
+
+    End If
+
+    For i = LBound(arr, 1) To UBound(arr, 1)
+
+        key = BuildKey( _
+                    arr(i, keyColRequest), _
+                    arr(i, keyColNumber))
+
+        ' Avoid empty records
+        If Len(key) > 1 Then
+
+            If Not dict.exists(key) Then
+
+                dict.Add key, i
+
+            End If
+
+        End If
+
+    Next i
+
+    Set BuildKeyDictionary = dict
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Build composite key
+' ---------------------------------------------------------------------------------
+
+Private Function BuildKey( _
+                    requestVal As Variant, _
+                    numberVal As Variant) As String
+
+    BuildKey = Trim(CStr(requestVal)) & "|" & _
+               Trim(CStr(numberVal))
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Prepare Changes sheet
+'
+' FINAL STRUCTURE:
+'
+' A = Select
+' B = Change Type
+' C onward = Original data
+' After original data:
+'     Changed By
+'     Time
+'     Date
+' ---------------------------------------------------------------------------------
+
+Private Function PrepareChangesSheet( _
+                    wb As Workbook, _
+                    headers As Variant, _
+                    colCount As Long) As Worksheet
+
+    Dim ws As Worksheet
+
+    Dim lastOutputCol As Long
+
+    On Error Resume Next
+
+    Set ws = wb.Sheets(CHANGES_SHEET_NAME)
+
+    On Error GoTo 0
+
+    ' -------------------------------------------------------------------------
+    ' Existing Changes sheet
+    ' -------------------------------------------------------------------------
+
+    If Not ws Is Nothing Then
+
+        ws.Cells.Clear
+
+    Else
+
+        Set ws = wb.Sheets.Add( _
+                    After:=wb.Sheets(wb.Sheets.Count))
+
+        ws.Name = CHANGES_SHEET_NAME
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' Calculate final column
+    '
+    ' 2 control columns
+    ' + original data columns
+    ' + 3 metadata columns
+    ' -------------------------------------------------------------------------
+
+    lastOutputCol = DATA_START_COL + colCount + EXTRA_COL_COUNT - 1
+
+    ' -------------------------------------------------------------------------
+    ' Column A
+    ' -------------------------------------------------------------------------
+
+    ws.Cells(1, SELECT_COL).value = HEADER_SELECT
+
+    ' -------------------------------------------------------------------------
+    ' Column B
+    ' -------------------------------------------------------------------------
+
+    ws.Cells(1, CHANGE_TYPE_COL).value = HEADER_CHANGE_TYPE
+
+    ' -------------------------------------------------------------------------
+    ' Original headers start at Column C
+    ' -------------------------------------------------------------------------
+
+    ws.Range( _
+            ws.Cells(1, DATA_START_COL), _
+            ws.Cells(1, DATA_START_COL + colCount - 1) _
+          ).value = headers
+
+    ' -------------------------------------------------------------------------
+    ' Extra metadata columns
+    ' -------------------------------------------------------------------------
+
+    ws.Cells(1, DATA_START_COL + colCount).value = HEADER_CHANGED_BY
+
+    ws.Cells(1, DATA_START_COL + colCount + 1).value = HEADER_TIME
+
+    ws.Cells(1, DATA_START_COL + colCount + 2).value = HEADER_DATE
+
+    ' -------------------------------------------------------------------------
+    ' Format headers
+    ' -------------------------------------------------------------------------
+
+    With ws.Range( _
+                ws.Cells(1, 1), _
+                ws.Cells(1, lastOutputCol))
+
+        .Font.Bold = True
+
+    End With
+
+    ' -------------------------------------------------------------------------
+    ' Add Data Validation to Select column
+    '
+    ' User can select only YES or NO
+    ' -------------------------------------------------------------------------
+
+    With ws.Range( _
+                ws.Cells(2, SELECT_COL), _
+                ws.Cells(ws.Rows.Count, SELECT_COL))
+
+        .Validation.Delete
+
+        .Validation.Add _
+            Type:=xlValidateList, _
+            AlertStyle:=xlValidAlertStop, _
+            Operator:=xlBetween, _
+            Formula1:="YES,NO"
+
+        .Validation.IgnoreBlank = True
+
+        .Validation.InCellDropdown = True
+
+    End With
+
+    ' -------------------------------------------------------------------------
+    ' Freeze header row
+    ' -------------------------------------------------------------------------
+
+    ws.Activate
+
+    ActiveWindow.SplitRow = 1
+    ActiveWindow.FreezePanes = True
+
+    Set PrepareChangesSheet = ws
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Compare and write report
+'
+' IMPORTANT:
+'
+' Changes sheet output starts at:
+'
+' A = Select
+' B = Change Type
+' C onward = original data
+' ---------------------------------------------------------------------------------
+
+Private Sub WriteComparisonReport( _
+                    wsChanges As Worksheet, _
+                    arrOld As Variant, _
+                    arrNew As Variant, _
+                    dictOld As Object, _
+                    dictNew As Object, _
+                    colCount As Long, _
+                    changeAuthor As String, _
+                    changeDateTime As Date, _
+                    ByRef countModified As Long, _
+                    ByRef countAdded As Long, _
+                    ByRef countDeleted As Long)
+
+    Dim outRow As Long
+
+    Dim key As Variant
+
+    Dim rOld As Long
+    Dim rNew As Long
+
+    Dim c As Long
+
+    Dim changedCols As Object
+
+    Dim isDifferent As Boolean
+
+    Dim timeText As String
+    Dim dateText As String
+
+    Dim rowBuffer() As Variant
+
+    ' -------------------------------------------------------------------------
+    ' Network file date/time
+    ' -------------------------------------------------------------------------
+
+    timeText = Format(changeDateTime, "hh:mm:ss")
+
+    dateText = GregorianToJalali( _
+                    Year(changeDateTime), _
+                    Month(changeDateTime), _
+                    Day(changeDateTime))
+
+    countModified = 0
+    countAdded = 0
+    countDeleted = 0
+
+    ' Row 1 = headers
+    outRow = 2
+
+    ' =========================================================================
+    ' PASS 1
+    '
+    ' Records existing in NEW file:
+    '
+    '     Modified
+    '     Added
+    ' =========================================================================
+
+    For Each key In dictNew.Keys
+
+        rNew = dictNew(key)
+
+        ' ---------------------------------------------------------------------
+        ' Record exists in both files
+        ' ---------------------------------------------------------------------
+
+        If dictOld.exists(key) Then
+
+            rOld = dictOld(key)
+
+            Set changedCols = CreateObject("Scripting.Dictionary")
+
+            isDifferent = False
+
+            ' -----------------------------------------------------------------
+            ' Compare all data columns
+            ' -----------------------------------------------------------------
+
+            For c = 1 To colCount
+
+                If Not ValuesEqual( _
+                        arrOld(rOld, c), _
+                        arrNew(rNew, c)) Then
+
+                    isDifferent = True
+
+                    changedCols.Add c, True
+
+                End If
+
+            Next c
+
+            ' -----------------------------------------------------------------
+            ' MODIFIED
+            ' -----------------------------------------------------------------
+
+            If isDifferent Then
+
+                ReDim rowBuffer( _
+                    1 To 1, _
+                    1 To colCount)
+
+                ' -------------------------------------------------------------
+                ' Copy NEW values
+                ' -------------------------------------------------------------
+
+                For c = 1 To colCount
+
+                    rowBuffer(1, c) = arrNew(rNew, c)
+
+                Next c
+
+                ' -------------------------------------------------------------
+                ' Select = NO
+                ' -------------------------------------------------------------
+
+                wsChanges.Cells( _
+                            outRow, _
+                            SELECT_COL).value = "NO"
+
+                ' -------------------------------------------------------------
+                ' Change Type = Modified
+                ' -------------------------------------------------------------
+
+                wsChanges.Cells( _
+                            outRow, _
+                            CHANGE_TYPE_COL).value = "Modified"
+
+                ' -------------------------------------------------------------
+                ' Write original data starting from Column C
+                ' -------------------------------------------------------------
+
+                wsChanges.Range( _
+                            wsChanges.Cells( _
+                                outRow, _
+                                DATA_START_COL), _
+                            wsChanges.Cells( _
+                                outRow, _
+                                DATA_START_COL + colCount - 1) _
+                        ).value = rowBuffer
+
+                ' -------------------------------------------------------------
+                ' Highlight only changed cells
+                ' -------------------------------------------------------------
+
+                For c = 1 To colCount
+
+                    If changedCols.exists(c) Then
+
+                        wsChanges.Cells( _
+                                    outRow, _
+                                    DATA_START_COL + c - 1 _
+                                ).Interior.Color = COLOR_MODIFIED
+
+                        ' -----------------------------------------------------
+                        ' Add old value as comment
+                        ' -----------------------------------------------------
+
+                        AddOldValueComment _
+                            wsChanges.Cells( _
+                                outRow, _
+                                DATA_START_COL + c - 1), _
+                            arrOld(rOld, c)
+
+                    End If
+
+                Next c
+
+                ' -------------------------------------------------------------
+                ' Metadata
+                ' -------------------------------------------------------------
+
+                wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount _
+                        ).value = changeAuthor
+
+                wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount + 1 _
+                        ).value = timeText
+
+                wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount + 2 _
+                        ).value = dateText
+
+                countModified = countModified + 1
+
+                outRow = outRow + 1
+
+            End If
+
+        Else
+
+            ' =================================================================
+            ' ADDED
+            '
+            ' Exists in NEW file but not in OLD file
+            ' =================================================================
+
+            ReDim rowBuffer( _
+                1 To 1, _
+                1 To colCount)
+
+            For c = 1 To colCount
+
+                rowBuffer(1, c) = arrNew(rNew, c)
+
+            Next c
+
+            ' -----------------------------------------------------------------
+            ' Select = NO
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        SELECT_COL).value = "NO"
+
+            ' -----------------------------------------------------------------
+            ' Change Type = Added
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        CHANGE_TYPE_COL).value = "Added"
+
+            ' -----------------------------------------------------------------
+            ' Write data starting at Column C
+            ' -----------------------------------------------------------------
+
+            wsChanges.Range( _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL), _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount - 1) _
+                    ).value = rowBuffer
+
+            ' -----------------------------------------------------------------
+            ' Highlight data cells
+            ' -----------------------------------------------------------------
+
+            wsChanges.Range( _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL), _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount - 1) _
+                    ).Interior.Color = COLOR_ADDED
+
+            ' -----------------------------------------------------------------
+            ' Metadata
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount _
+                    ).value = changeAuthor
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount + 1 _
+                    ).value = timeText
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount + 2 _
+                    ).value = dateText
+
+            countAdded = countAdded + 1
+
+            outRow = outRow + 1
+
+        End If
+
+    Next key
+
+    ' =========================================================================
+    ' PASS 2
+    '
+    ' Records existing only in OLD file:
+    '
+    '     Deleted
+    ' =========================================================================
+
+    For Each key In dictOld.Keys
+
+        If Not dictNew.exists(key) Then
+
+            rOld = dictOld(key)
+
+            ReDim rowBuffer( _
+                1 To 1, _
+                1 To colCount)
+
+            ' -----------------------------------------------------------------
+            ' Copy OLD values
+            ' -----------------------------------------------------------------
+
+            For c = 1 To colCount
+
+                rowBuffer(1, c) = arrOld(rOld, c)
+
+            Next c
+
+            ' -----------------------------------------------------------------
+            ' Select = NO
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        SELECT_COL).value = "NO"
+
+            ' -----------------------------------------------------------------
+            ' Change Type = Deleted
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        CHANGE_TYPE_COL).value = "Deleted"
+
+            ' -----------------------------------------------------------------
+            ' Write data starting at Column C
+            ' -----------------------------------------------------------------
+
+            wsChanges.Range( _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL), _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount - 1) _
+                    ).value = rowBuffer
+
+            ' -----------------------------------------------------------------
+            ' Highlight deleted row
+            ' -----------------------------------------------------------------
+
+            wsChanges.Range( _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL), _
+                        wsChanges.Cells( _
+                            outRow, _
+                            DATA_START_COL + colCount - 1) _
+                    ).Interior.Color = COLOR_DELETED
+
+            ' -----------------------------------------------------------------
+            ' Metadata
+            ' -----------------------------------------------------------------
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount _
+                    ).value = changeAuthor
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount + 1 _
+                    ).value = timeText
+
+            wsChanges.Cells( _
+                        outRow, _
+                        DATA_START_COL + colCount + 2 _
+                    ).value = dateText
+
+            countDeleted = countDeleted + 1
+
+            outRow = outRow + 1
+
+        End If
+
+    Next key
+
+    ' =========================================================================
+    ' Final formatting
+    ' =========================================================================
+
+    wsChanges.Columns.AutoFit
+
+    ' -------------------------------------------------------------------------
+    ' Add AutoFilter
+    ' -------------------------------------------------------------------------
+
+    If outRow > 2 Then
+
+        wsChanges.Range( _
+                    wsChanges.Cells(1, 1), _
+                    wsChanges.Cells( _
+                        outRow - 1, _
+                        DATA_START_COL + colCount + EXTRA_COL_COUNT - 1) _
+                ).AutoFilter
+
+    End If
+
+    ' -------------------------------------------------------------------------
+    ' Center Select and Change Type
+    ' -------------------------------------------------------------------------
+
+    If outRow > 2 Then
+
+        wsChanges.Range( _
+                    wsChanges.Cells(2, SELECT_COL), _
+                    wsChanges.Cells( _
+                        outRow - 1, _
+                        CHANGE_TYPE_COL) _
+                ).HorizontalAlignment = xlCenter
+
+    End If
+
+End Sub
+
+' ---------------------------------------------------------------------------------
+' Add comment containing previous value
+' ---------------------------------------------------------------------------------
+
+Private Sub AddOldValueComment( _
+                    targetCell As Range, _
+                    oldValue As Variant)
+
+    Dim commentText As String
+    Dim displayValue As String
+
+    If IsEmpty(oldValue) Or IsNull(oldValue) Then
+
+        displayValue = "(empty)"
+
+    Else
+
+        displayValue = CStr(oldValue)
+
+        If Len(Trim(displayValue)) = 0 Then
+            displayValue = "(empty)"
+        End If
+
+    End If
+
+    commentText = "Previous value: " & displayValue
+
+    ' Remove existing comment if present
+
+    On Error Resume Next
+
+    If Not targetCell.Comment Is Nothing Then
+
+        targetCell.Comment.Delete
+
+    End If
+
+    On Error GoTo 0
+
+    targetCell.AddComment Text:=commentText
+
+    targetCell.Comment.Shape.TextFrame.AutoSize = True
+
+End Sub
+
+' ---------------------------------------------------------------------------------
+' Convert Gregorian date to Jalali
+'
+' Output:
+'     yyyy/mm/dd
+' ---------------------------------------------------------------------------------
+
+Private Function GregorianToJalali( _
+                    gy As Long, _
+                    gm As Long, _
+                    gd As Long) As String
+
+    Dim g_d_m As Variant
+
+    g_d_m = Array( _
+                0, 31, 59, 90, 120, 151, _
+                181, 212, 243, 273, 304, 334)
+
+    Dim jy As Long
+    Dim jm As Long
+    Dim jd As Long
+
+    Dim gy2 As Long
+    Dim gyTemp As Long
+
+    Dim days As Long
+
+    If gy > 1600 Then
+
+        jy = 979
+
+        gy2 = gy - 1600
+
+    Else
+
+        jy = 0
+
+        gy2 = gy - 621
+
+    End If
+
+    If gm > 2 Then
+
+        gyTemp = gy2 + 1
+
+    Else
+
+        gyTemp = gy2
+
+    End If
+
+    days = 365 * gy2 + _
+           Int((gyTemp + 3) / 4) - _
+           Int((gyTemp + 99) / 100) + _
+           Int((gyTemp + 399) / 400) - _
+           80 + _
+           gd + _
+           g_d_m(gm - 1)
+
+    jy = jy + 33 * Int(days / 12053)
+
+    days = days Mod 12053
+
+    jy = jy + 4 * Int(days / 1461)
+
+    days = days Mod 1461
+
+    If days > 365 Then
+
+        jy = jy + Int((days - 1) / 365)
+
+        days = (days - 1) Mod 365
+
+    End If
+
+    If days < 186 Then
+
+        jm = 1 + Int(days / 31)
+
+        jd = 1 + (days Mod 31)
+
+    Else
+
+        jm = 7 + Int((days - 186) / 30)
+
+        jd = 1 + ((days - 186) Mod 30)
+
+    End If
+
+    GregorianToJalali = _
+        CStr(jy) & "/" & _
+        Format(jm, "00") & "/" & _
+        Format(jd, "00")
+
+End Function
+
+' ---------------------------------------------------------------------------------
+' Safely compare two cell values
+' ---------------------------------------------------------------------------------
+
+Private Function ValuesEqual( _
+                    v1 As Variant, _
+                    v2 As Variant) As Boolean
+
+    Dim s1 As String
+    Dim s2 As String
+
+    If IsError(v1) Or IsError(v2) Then
+
+        ValuesEqual = False
+
+        Exit Function
+
+    End If
+
+    s1 = Trim(CStr(v1))
+    s2 = Trim(CStr(v2))
+
+    ValuesEqual = _
+        (StrComp(s1, s2, vbTextCompare) = 0)
+
+End Function
+
+
+
