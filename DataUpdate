@@ -1,211 +1,146 @@
 Option Explicit
-
-' Selective updater for the Changes sheet.
-' Changes row 1: Select | Change Type | original Sheet1 headers... | metadata
-' Sheet1 headers are on row 2; data starts on row 3.
-' YES + Modified: replace ALL mapped data fields (including blanks) in the matched record.
-' YES + Added: append all mapped data fields, including blanks.
-' YES + Deleted: delete the matched record.
-' NO/blank: leave Sheet1 unchanged.
-
-Private Const SOURCE_FILE_PATH As String = "Y:\Drawing Factories\Drawing List Factories-NEW.xlsm"
 Private Const CHANGES_SHEET_NAME As String = "Changes"
 Private Const TARGET_SHEET_INDEX As Long = 1
 Private Const HEADER_ROW As Long = 2
-Private Const CHANGES_HEADER_ROW As Long = 1
 Private Const SELECT_COL As Long = 1
 Private Const TYPE_COL As Long = 2
 Private Const DATA_START_COL As Long = 3
-Private Const SELECT_YES As String = "YES"
 
 Public Sub Copy_Drawing_List()
     Dim wb As Workbook, ws As Worksheet, wc As Worksheet
-    Dim lastChangesRow As Long, r As Long, targetRow As Long
+    Dim lr As Long, lc As Long, r As Long, c As Long, tr As Long, dc As Long
     Dim reqT As Long, numT As Long, reqC As Long, numC As Long
-    Dim selected As Long, nMod As Long, nAdd As Long, nDel As Long
-    Dim skipped As Long, errors As Long
-    Dim action As String, pick As String
-    Dim oldCalc As XlCalculation, oldScreen As Boolean, oldEvents As Boolean, oldAlerts As Boolean
-    Dim hdr As String, c As Long, destCol As Long, lastChangesCol As Long
+    Dim selected As Long, nMod As Long, nAdd As Long, nDel As Long, skipped As Long, errors As Long
+    Dim pick As String, action As String, hdr As String
     Dim req As Variant, num As Variant
+    Dim oldCalc As XlCalculation, oldScreen As Boolean, oldEvents As Boolean, oldAlerts As Boolean
 
     On Error GoTo Fail
-    oldScreen = Application.ScreenUpdating
-    oldEvents = Application.EnableEvents
-    oldAlerts = Application.DisplayAlerts
-    oldCalc = Application.Calculation
-
+    oldScreen = Application.ScreenUpdating: oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts: oldCalc = Application.Calculation
     If MsgBox("Process only Changes rows with Select = YES?" & vbCrLf & vbCrLf & _
-              "Modified = replace the full matched record" & vbCrLf & _
-              "Added = append the full record" & vbCrLf & _
-              "Deleted = remove the matched record", _
-              vbOKCancel + vbQuestion, "Selective Data Update") <> vbOK Then Exit Sub
+        "Modified = replace full record" & vbCrLf & "Added = append full record" & vbCrLf & _
+        "Deleted = remove record", vbOKCancel + vbQuestion, "DataUpdate") <> vbOK Then Exit Sub
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationManual
-
-    Set wb = ThisWorkbook
-    Set ws = wb.Worksheets(TARGET_SHEET_INDEX)
+    Application.ScreenUpdating = False: Application.EnableEvents = False
+    Application.DisplayAlerts = False: Application.Calculation = xlCalculationManual
+    Set wb = ThisWorkbook: Set ws = wb.Worksheets(TARGET_SHEET_INDEX)
     Set wc = wb.Worksheets(CHANGES_SHEET_NAME)
 
-    reqT = HeaderCol(ws, HEADER_ROW, "REQUEST")
-    numT = HeaderCol(ws, HEADER_ROW, "NUMBER")
-    reqC = HeaderCol(wc, CHANGES_HEADER_ROW, "REQUEST")
-    numC = HeaderCol(wc, CHANGES_HEADER_ROW, "NUMBER")
-    If reqT = 0 Or numT = 0 Or reqC = 0 Or numC = 0 Then
-        Err.Raise vbObjectError + 100, , "REQUEST/NUMBER header is missing in Sheet1 or Changes."
-    End If
+    reqT = HeaderCol(ws, HEADER_ROW, "REQUEST"): numT = HeaderCol(ws, HEADER_ROW, "NUMBER")
+    reqC = HeaderCol(wc, 1, "REQUEST"): numC = HeaderCol(wc, 1, "NUMBER")
+    If reqT = 0 Or numT = 0 Or reqC = 0 Or numC = 0 Then Err.Raise vbObjectError + 100, , "REQUEST/NUMBER header missing."
 
-    lastChangesRow = LastRow(wc)
-    lastChangesCol = LastCol(wc, CHANGES_HEADER_ROW)
-
-    For r = 2 To lastChangesRow
+    lr = LastRow(wc): lc = LastCol(wc, 1)
+    For r = 2 To lr
         pick = UCase$(Trim$(SafeText(wc.Cells(r, SELECT_COL).Value2)))
-        If pick <> SELECT_YES Then
-            skipped = skipped + 1
-            GoTo ContinueRow
-        End If
+        If pick <> "YES" Then skipped = skipped + 1: GoTo NextR
         selected = selected + 1
         action = UCase$(Trim$(SafeText(wc.Cells(r, TYPE_COL).Value2)))
-        req = wc.Cells(r, reqC).Value2
-        num = wc.Cells(r, numC).Value2
+        req = wc.Cells(r, reqC).Value2: num = wc.Cells(r, numC).Value2
 
         Select Case action
-            Case "MODIFIED", "MODIFY"
-                targetRow = FindRecord(ws, reqT, numT, req)
-                If targetRow = 0 Then
-                    errors = errors + 1
-                Else
-                    ' Replace every matching source-data field. Empty cells are intentionally copied.
-                    For c = DATA_START_COL To lastChangesCol
-                        hdr = Trim$(SafeText(wc.Cells(CHANGES_HEADER_ROW, c).Value2))
-                        If Len(hdr) > 0 And Not IsMetadata(hdr) Then
-                            destCol = HeaderCol(ws, HEADER_ROW, hdr)
-                            If destCol > 0 Then ws.Cells(targetRow, destCol).Value2 = wc.Cells(r, c).Value2
-                        End If
-                    Next c
-                    nMod = nMod + 1
-                End If
-
-            Case "ADDED", "ADD"
-                If FindRecord(ws, reqT, numT, req) > 0 Then
-                    errors = errors + 1  ' prevent accidental duplicate key
-                Else
-                    targetRow = LastRow(ws) + 1
-                    If targetRow <= HEADER_ROW Then targetRow = HEADER_ROW + 1
-                    For c = DATA_START_COL To lastChangesCol
-                        hdr = Trim$(SafeText(wc.Cells(CHANGES_HEADER_ROW, c).Value2))
-                        If Len(hdr) > 0 And Not IsMetadata(hdr) Then
-                            destCol = HeaderCol(ws, HEADER_ROW, hdr)
-                            If destCol > 0 Then ws.Cells(targetRow, destCol).Value2 = wc.Cells(r, c).Value2
-                        End If
-                    Next c
-                    nAdd = nAdd + 1
-                End If
-
-            Case "DELETED", "DELETE"
-                targetRow = FindRecord(ws, reqT, numT, req)
-                If targetRow = 0 Then
-                    errors = errors + 1
-                Else
-                    ws.Rows(targetRow).Delete
-                    nDel = nDel + 1
-                End If
-
-            Case Else
+        Case "MODIFIED", "MODIFY"
+            tr = FindRecord(ws, reqT, numT, req, num)
+            If tr = 0 Then
                 errors = errors + 1
+            Else
+                ' Full replacement: all mapped data columns are written, including intentional blanks.
+                For c = DATA_START_COL To lc
+                    hdr = Trim$(SafeText(wc.Cells(1, c).Value2))
+                    If Len(hdr) > 0 And Not IsMetadata(hdr) Then
+                        dc = HeaderCol(ws, HEADER_ROW, hdr)
+                        If dc > 0 Then ws.Cells(tr, dc).Value2 = wc.Cells(r, c).Value2
+                    End If
+                Next c
+                nMod = nMod + 1
+            End If
+
+        Case "ADDED", "ADD"
+            If FindRecord(ws, reqT, numT, req, num) > 0 Then
+                errors = errors + 1
+            Else
+                tr = LastRow(ws) + 1
+                If tr <= HEADER_ROW Then tr = HEADER_ROW + 1
+                For c = DATA_START_COL To lc
+                    hdr = Trim$(SafeText(wc.Cells(1, c).Value2))
+                    If Len(hdr) > 0 And Not IsMetadata(hdr) Then
+                        dc = HeaderCol(ws, HEADER_ROW, hdr)
+                        If dc > 0 Then ws.Cells(tr, dc).Value2 = wc.Cells(r, c).Value2
+                    End If
+                Next c
+                nAdd = nAdd + 1
+            End If
+
+        Case "DELETED", "DELETE"
+            tr = FindRecord(ws, reqT, numT, req, num)
+            If tr = 0 Then
+                errors = errors + 1
+            Else
+                ws.Rows(tr).Delete
+                nDel = nDel + 1
+            End If
+        Case Else
+            errors = errors + 1
         End Select
-ContinueRow:
+NextR:
     Next r
 
-    MsgBox "DataUpdate completed." & vbCrLf & vbCrLf & _
-           "Selected YES: " & selected & vbCrLf & _
-           "Modified: " & nMod & vbCrLf & "Added: " & nAdd & vbCrLf & _
-           "Deleted: " & nDel & vbCrLf & "Skipped: " & skipped & vbCrLf & _
-           "Errors/not applied: " & errors, vbInformation, "DataUpdate"
-
+    MsgBox "Completed." & vbCrLf & "Selected YES: " & selected & vbCrLf & _
+        "Modified: " & nMod & vbCrLf & "Added: " & nAdd & vbCrLf & _
+        "Deleted: " & nDel & vbCrLf & "Skipped: " & skipped & vbCrLf & _
+        "Errors/not applied: " & errors, vbInformation, "DataUpdate"
 CleanExit:
-    Application.ScreenUpdating = oldScreen
-    Application.EnableEvents = oldEvents
-    Application.DisplayAlerts = oldAlerts
-    Application.Calculation = oldCalc
+    Application.ScreenUpdating = oldScreen: Application.EnableEvents = oldEvents
+    Application.DisplayAlerts = oldAlerts: Application.Calculation = oldCalc
     Exit Sub
-
 Fail:
     MsgBox "DataUpdate stopped: " & Err.Description, vbCritical, "DataUpdate Error"
     Resume CleanExit
 End Sub
 
-Private Function HeaderCol(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headerName As String) As Long
-    Dim c As Long, lc As Long, candidate As String
-    lc = LastCol(ws, rowNum)
+Private Function HeaderCol(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal name As String) As Long
+    Dim c As Long, lc As Long
+    lc = LastCol(ws, headerRow)
     For c = 1 To lc
-        candidate = Trim$(SafeText(ws.Cells(rowNum, c).Value2))
-        If StrComp(candidate, Trim$(headerName), vbTextCompare) = 0 Then
-            HeaderCol = c
-            Exit Function
+        If StrComp(Trim$(SafeText(ws.Cells(headerRow, c).Value2)), Trim$(name), vbTextCompare) = 0 Then
+            HeaderCol = c: Exit Function
         End If
     Next c
 End Function
 
 Private Function FindRecord(ByVal ws As Worksheet, ByVal reqCol As Long, ByVal numCol As Long, _
-                            ByVal reqValue As Variant) As Long
-    ' REQUEST + NUMBER key is passed as the two adjacent key values below.
-    ' Kept as a dedicated helper to make matching behavior consistent for all action types.
-    Dim r As Long, lr As Long
-    Dim reqKey As String, numKey As String
-    reqKey = NormalizeKey(reqValue)
-    ' NUMBER is supplied via module-level call wrapper in FindRecordByKey.
-    FindRecord = 0
-End Function
-
-Private Function FindRecordByKey(ByVal ws As Worksheet, ByVal reqCol As Long, ByVal numCol As Long, _
-                                 ByVal reqValue As Variant, ByVal numValue As Variant) As Long
+                            ByVal reqValue As Variant, ByVal numValue As Variant) As Long
     Dim r As Long, lr As Long
     lr = LastRow(ws)
     For r = HEADER_ROW + 1 To lr
-        If NormalizeKey(ws.Cells(r, reqCol).Value2) = NormalizeKey(reqValue) And _
-           NormalizeKey(ws.Cells(r, numCol).Value2) = NormalizeKey(numValue) Then
-            FindRecordByKey = r
-            Exit Function
+        If StrComp(NormalizeKey(ws.Cells(r, reqCol).Value2), NormalizeKey(reqValue), vbTextCompare) = 0 _
+        And StrComp(NormalizeKey(ws.Cells(r, numCol).Value2), NormalizeKey(numValue), vbTextCompare) = 0 Then
+            FindRecord = r: Exit Function
         End If
     Next r
 End Function
 
 Private Function NormalizeKey(ByVal v As Variant) As String
-    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then
-        NormalizeKey = ""
-    Else
-        NormalizeKey = Trim$(CStr(v))
-    End If
+    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then NormalizeKey = "" Else NormalizeKey = Trim$(CStr(v))
 End Function
-
 Private Function SafeText(ByVal v As Variant) As String
-    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then
-        SafeText = ""
-    Else
-        SafeText = CStr(v)
-    End If
+    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then SafeText = "" Else SafeText = CStr(v)
 End Function
-
-Private Function IsMetadata(ByVal headerName As String) As Boolean
-    IsMetadata = (StrComp(headerName, "Changed By", vbTextCompare) = 0 Or _
-                  StrComp(headerName, "Time", vbTextCompare) = 0 Or _
-                  StrComp(headerName, "Date", vbTextCompare) = 0)
+Private Function IsMetadata(ByVal h As String) As Boolean
+    IsMetadata = (StrComp(h, "Changed By", vbTextCompare) = 0 Or _
+                  StrComp(h, "Time", vbTextCompare) = 0 Or _
+                  StrComp(h, "Date", vbTextCompare) = 0)
 End Function
-
 Private Function LastRow(ByVal ws As Worksheet) As Long
     Dim f As Range
-    Set f = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
-                          LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    Set f = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, _
+        SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
     If f Is Nothing Then LastRow = 1 Else LastRow = f.Row
 End Function
-
-Private Function LastCol(ByVal ws As Worksheet, Optional ByVal rowNum As Long = 1) As Long
+Private Function LastCol(ByVal ws As Worksheet, Optional ByVal headerRow As Long = 1) As Long
     Dim f As Range
-    Set f = ws.Rows(rowNum).Find(What:="*", After:=ws.Cells(rowNum, 1), LookIn:=xlFormulas, _
-                                 LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
+    Set f = ws.Rows(headerRow).Find(What:="*", After:=ws.Cells(headerRow, 1), LookIn:=xlFormulas, _
+        LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
     If f Is Nothing Then LastCol = 1 Else LastCol = f.Column
 End Function
