@@ -1,1081 +1,211 @@
 Option Explicit
 
-'===============================================================================
-' MODULE: DataUpdate
-'
-' PURPOSE:
-'   Update only the records selected as YES in the "Changes" sheet.
-'
-' CHANGES SHEET STRUCTURE:
-'
-'   Column A = Select
-'   Column B = Change Type
-'   Column C onward = Original data
-'
-' Change Type:
-'   Modified
-'   Added
-'   Deleted
-'
-' KEY:
-'   REQUEST + NUMBER
-'
-' SOURCE:
-'   Y:\Drawing Factories\Drawing List Factories-NEW.xlsm
-'
-' IMPORTANT:
-'   This code DOES NOT clear the target sheet.
-'   It only processes rows where Select = YES.
-'===============================================================================
+' Selective updater for the Changes sheet.
+' Changes row 1: Select | Change Type | original Sheet1 headers... | metadata
+' Sheet1 headers are on row 2; data starts on row 3.
+' YES + Modified: replace ALL mapped data fields (including blanks) in the matched record.
+' YES + Added: append all mapped data fields, including blanks.
+' YES + Deleted: delete the matched record.
+' NO/blank: leave Sheet1 unchanged.
 
-
-'===============================================================================
-' CONFIGURATION
-'===============================================================================
-
-Private Const SOURCE_FILE_PATH As String = _
-    "Y:\Drawing Factories\Drawing List Factories-NEW.xlsm"
-
+Private Const SOURCE_FILE_PATH As String = "Y:\Drawing Factories\Drawing List Factories-NEW.xlsm"
 Private Const CHANGES_SHEET_NAME As String = "Changes"
-
 Private Const TARGET_SHEET_INDEX As Long = 1
-Private Const SOURCE_SHEET_INDEX As Long = 1
-
 Private Const HEADER_ROW As Long = 2
-
+Private Const CHANGES_HEADER_ROW As Long = 1
 Private Const SELECT_COL As Long = 1
-Private Const CHANGE_TYPE_COL As Long = 2
+Private Const TYPE_COL As Long = 2
 Private Const DATA_START_COL As Long = 3
-
-Private Const KEY_COL_REQUEST As String = "REQUEST"
-Private Const KEY_COL_NUMBER As String = "NUMBER"
-
 Private Const SELECT_YES As String = "YES"
 
-Private Const CHANGE_MODIFIED As String = "MODIFIED"
-Private Const CHANGE_ADDED As String = "ADDED"
-Private Const CHANGE_DELETED As String = "DELETED"
-
-
-'===============================================================================
-' MAIN MACRO
-'===============================================================================
-
 Public Sub Copy_Drawing_List()
+    Dim wb As Workbook, ws As Worksheet, wc As Worksheet
+    Dim lastChangesRow As Long, r As Long, targetRow As Long
+    Dim reqT As Long, numT As Long, reqC As Long, numC As Long
+    Dim selected As Long, nMod As Long, nAdd As Long, nDel As Long
+    Dim skipped As Long, errors As Long
+    Dim action As String, pick As String
+    Dim oldCalc As XlCalculation, oldScreen As Boolean, oldEvents As Boolean, oldAlerts As Boolean
+    Dim hdr As String, c As Long, destCol As Long, lastChangesCol As Long
+    Dim req As Variant, num As Variant
 
-    Dim wbTarget As Workbook
-    Dim wbSource As Workbook
+    On Error GoTo Fail
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts
+    oldCalc = Application.Calculation
 
-    Dim wsTarget As Worksheet
-    Dim wsSource As Worksheet
-    Dim wsChanges As Worksheet
-
-    Dim targetTable As ListObject
-
-    Dim sourceLastRow As Long
-    Dim sourceLastCol As Long
-
-    Dim targetLastRow As Long
-    Dim targetLastCol As Long
-
-    Dim changesLastRow As Long
-    Dim changesLastCol As Long
-
-    Dim requestColTarget As Long
-    Dim numberColTarget As Long
-
-    Dim requestColSource As Long
-    Dim numberColSource As Long
-
-    Dim requestColChanges As Long
-    Dim numberColChanges As Long
-
-    Dim selectedCount As Long
-    Dim modifiedCount As Long
-    Dim addedCount As Long
-    Dim deletedCount As Long
-    Dim skippedCount As Long
-    Dim errorCount As Long
-
-    Dim i As Long
-
-    Dim result As VbMsgBoxResult
-
-    Dim oldCalculation As XlCalculation
-    Dim oldScreenUpdating As Boolean
-    Dim oldEnableEvents As Boolean
-    Dim oldDisplayAlerts As Boolean
-
-    Dim sourceWasOpened As Boolean
-
-    On Error GoTo ErrorHandler
-
-
-    '===========================================================================
-    ' CONFIRMATION
-    '===========================================================================
-
-    result = MsgBox( _
-                "Only records with Select = YES will be updated." & vbCrLf & vbCrLf & _
-                "Modified = update existing record" & vbCrLf & _
-                "Added    = add new record" & vbCrLf & _
-                "Deleted  = delete existing record" & vbCrLf & vbCrLf & _
-                "Do you want to continue?", _
-                vbOKCancel + vbQuestion, _
-                "Selective Data Update")
-
-
-    If result = vbCancel Then
-        Exit Sub
-    End If
-
-
-    '===========================================================================
-    ' SAVE EXCEL SETTINGS
-    '===========================================================================
-
-    oldScreenUpdating = Application.ScreenUpdating
-    oldEnableEvents = Application.EnableEvents
-    oldDisplayAlerts = Application.DisplayAlerts
-    oldCalculation = Application.Calculation
+    If MsgBox("Process only Changes rows with Select = YES?" & vbCrLf & vbCrLf & _
+              "Modified = replace the full matched record" & vbCrLf & _
+              "Added = append the full record" & vbCrLf & _
+              "Deleted = remove the matched record", _
+              vbOKCancel + vbQuestion, "Selective Data Update") <> vbOK Then Exit Sub
 
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.DisplayAlerts = False
     Application.Calculation = xlCalculationManual
 
+    Set wb = ThisWorkbook
+    Set ws = wb.Worksheets(TARGET_SHEET_INDEX)
+    Set wc = wb.Worksheets(CHANGES_SHEET_NAME)
 
-    '===========================================================================
-    ' SET WORKBOOK / SHEETS
-    '===========================================================================
-
-    Set wbTarget = ThisWorkbook
-
-    Set wsTarget = wbTarget.Sheets(TARGET_SHEET_INDEX)
-
-
-    '===========================================================================
-    ' FIND CHANGES SHEET
-    '===========================================================================
-
-    On Error Resume Next
-
-    Set wsChanges = wbTarget.Worksheets(CHANGES_SHEET_NAME)
-
-    On Error GoTo ErrorHandler
-
-    If wsChanges Is Nothing Then
-
-        MsgBox _
-            "The sheet '" & CHANGES_SHEET_NAME & "' was not found.", _
-            vbCritical, _
-            "Changes Sheet Missing"
-
-        GoTo SafeExit
-
+    reqT = HeaderCol(ws, HEADER_ROW, "REQUEST")
+    numT = HeaderCol(ws, HEADER_ROW, "NUMBER")
+    reqC = HeaderCol(wc, CHANGES_HEADER_ROW, "REQUEST")
+    numC = HeaderCol(wc, CHANGES_HEADER_ROW, "NUMBER")
+    If reqT = 0 Or numT = 0 Or reqC = 0 Or numC = 0 Then
+        Err.Raise vbObjectError + 100, , "REQUEST/NUMBER header is missing in Sheet1 or Changes."
     End If
 
+    lastChangesRow = LastRow(wc)
+    lastChangesCol = LastCol(wc, CHANGES_HEADER_ROW)
 
-    '===========================================================================
-    ' FIND LAST ROW / COLUMN IN CHANGES
-    '===========================================================================
-
-    changesLastRow = LastUsedRow(wsChanges)
-    changesLastCol = LastUsedColumn(wsChanges)
-
-
-    If changesLastRow <= 1 Then
-
-        MsgBox _
-            "There are no records in the Changes sheet.", _
-            vbInformation, _
-            "Nothing to Update"
-
-        GoTo SafeExit
-
-    End If
-
-
-    '===========================================================================
-    ' FIND REQUEST / NUMBER COLUMNS IN TARGET
-    '===========================================================================
-
-    requestColTarget = FindHeaderColumn( _
-                            wsTarget, _
-                            HEADER_ROW, _
-                            KEY_COL_REQUEST)
-
-    numberColTarget = FindHeaderColumn( _
-                            wsTarget, _
-                            HEADER_ROW, _
-                            KEY_COL_NUMBER)
-
-
-    If requestColTarget = 0 Then
-
-        MsgBox _
-            "REQUEST column was not found in the target sheet.", _
-            vbCritical, _
-            "Missing Column"
-
-        GoTo SafeExit
-
-    End If
-
-
-    If numberColTarget = 0 Then
-
-        MsgBox _
-            "NUMBER column was not found in the target sheet.", _
-            vbCritical, _
-            "Missing Column"
-
-        GoTo SafeExit
-
-    End If
-
-
-    '===========================================================================
-    ' FIND REQUEST / NUMBER COLUMNS IN CHANGES
-    '
-    ' Changes:
-    ' A = Select
-    ' B = Change Type
-    ' C onward = original data
-    '
-    ' Therefore the original header REQUEST / NUMBER are searched normally.
-    '===========================================================================
-
-    requestColChanges = FindHeaderColumn( _
-                            wsChanges, _
-                            1, _
-                            KEY_COL_REQUEST)
-
-    numberColChanges = FindHeaderColumn( _
-                            wsChanges, _
-                            1, _
-                            KEY_COL_NUMBER)
-
-
-    If requestColChanges = 0 Then
-
-        MsgBox _
-            "REQUEST column was not found in the Changes sheet.", _
-            vbCritical, _
-            "Missing Column"
-
-        GoTo SafeExit
-
-    End If
-
-
-    If numberColChanges = 0 Then
-
-        MsgBox _
-            "NUMBER column was not found in the Changes sheet.", _
-            vbCritical, _
-            "Missing Column"
-
-        GoTo SafeExit
-
-    End If
-
-
-    '===========================================================================
-    ' OPEN SOURCE WORKBOOK
-    '===========================================================================
-
-    If Dir(SOURCE_FILE_PATH) = "" Then
-
-        MsgBox _
-            "The source workbook could not be found:" & vbCrLf & vbCrLf & _
-            SOURCE_FILE_PATH, _
-            vbCritical, _
-            "Source File Not Found"
-
-        GoTo SafeExit
-
-    End If
-
-
-    Set wbSource = Workbooks.Open( _
-                        Filename:=SOURCE_FILE_PATH, _
-                        UpdateLinks:=0, _
-                        ReadOnly:=True, _
-                        IgnoreReadOnlyRecommended:=True)
-
-    sourceWasOpened = True
-
-    Set wsSource = wbSource.Sheets(SOURCE_SHEET_INDEX)
-
-
-    '===========================================================================
-    ' FIND SOURCE DATA DIMENSIONS
-    '===========================================================================
-
-    sourceLastRow = LastUsedRow(wsSource)
-    sourceLastCol = LastUsedColumn(wsSource)
-
-
-    '===========================================================================
-    ' FIND REQUEST / NUMBER COLUMNS IN SOURCE
-    '===========================================================================
-
-    requestColSource = FindHeaderColumn( _
-                            wsSource, _
-                            HEADER_ROW, _
-                            KEY_COL_REQUEST)
-
-    numberColSource = FindHeaderColumn( _
-                            wsSource, _
-                            HEADER_ROW, _
-                            KEY_COL_NUMBER)
-
-
-    '===========================================================================
-    ' PROCESS ONLY YES RECORDS
-    '===========================================================================
-
-    For i = 2 To changesLastRow
-
-        Dim selectValue As String
-        Dim changeType As String
-
-        selectValue = UCase$( _
-                        Trim$( _
-                            CStr(wsChanges.Cells(i, SELECT_COL).value) _
-                        ) _
-                      )
-
-        '-----------------------------------------------------------------------
-        ' Ignore NO / blank
-        '-----------------------------------------------------------------------
-
-        If selectValue <> SELECT_YES Then
-
-            skippedCount = skippedCount + 1
-
-            GoTo NextChangeRow
-
+    For r = 2 To lastChangesRow
+        pick = UCase$(Trim$(SafeText(wc.Cells(r, SELECT_COL).Value2)))
+        If pick <> SELECT_YES Then
+            skipped = skipped + 1
+            GoTo ContinueRow
         End If
-
-
-        selectedCount = selectedCount + 1
-
-
-        '-----------------------------------------------------------------------
-        ' Read Change Type
-        '-----------------------------------------------------------------------
-
-        changeType = UCase$( _
-                        Trim$( _
-                            CStr(wsChanges.Cells(i, CHANGE_TYPE_COL).value) _
-                        ) _
-                     )
-
-
-        '-----------------------------------------------------------------------
-        ' PROCESS MODIFIED
-        '-----------------------------------------------------------------------
-
-        If changeType = CHANGE_MODIFIED Then
-
-            If ProcessModified( _
-                    wsTarget, _
-                    wsChanges, _
-                    i, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestColChanges, _
-                    numberColChanges) Then
-
-                modifiedCount = modifiedCount + 1
-
-            Else
-
-                errorCount = errorCount + 1
-
-            End If
-
-
-        '-----------------------------------------------------------------------
-        ' PROCESS ADDED
-        '-----------------------------------------------------------------------
-
-        ElseIf changeType = CHANGE_ADDED Then
-
-            If ProcessAdded( _
-                    wsTarget, _
-                    wsChanges, _
-                    i, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestColChanges, _
-                    numberColChanges, _
-                    sourceLastCol) Then
-
-                addedCount = addedCount + 1
-
-            Else
-
-                errorCount = errorCount + 1
-
-            End If
-
-
-        '-----------------------------------------------------------------------
-        ' PROCESS DELETED
-        '-----------------------------------------------------------------------
-
-        ElseIf changeType = CHANGE_DELETED Then
-
-            If ProcessDeleted( _
-                    wsTarget, _
-                    wsChanges, _
-                    i, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestColChanges, _
-                    numberColChanges) Then
-
-                deletedCount = deletedCount + 1
-
-            Else
-
-                errorCount = errorCount + 1
-
-            End If
-
-
-        '-----------------------------------------------------------------------
-        ' UNKNOWN CHANGE TYPE
-        '-----------------------------------------------------------------------
-
-        Else
-
-            errorCount = errorCount + 1
-
-        End If
-
-
-NextChangeRow:
-
-    Next i
-
-
-    '===========================================================================
-    ' CLOSE SOURCE
-    '===========================================================================
-
-    If sourceWasOpened Then
-
-        wbSource.Close SaveChanges:=False
-
-        sourceWasOpened = False
-
-    End If
-
-
-    '===========================================================================
-    ' REFRESH TABLE / FORMULAS IF NEEDED
-    '===========================================================================
-
-    On Error Resume Next
-
-    wbTarget.RefreshAll
-
-    On Error GoTo ErrorHandler
-
-
-    '===========================================================================
-    ' FINAL MESSAGE
-    '===========================================================================
-
-    MsgBox _
-        "Selective update completed." & vbCrLf & vbCrLf & _
-        "Selected (YES): " & selectedCount & vbCrLf & _
-        "Modified: " & modifiedCount & vbCrLf & _
-        "Added: " & addedCount & vbCrLf & _
-        "Deleted: " & deletedCount & vbCrLf & _
-        "Skipped (NO/blank): " & skippedCount & vbCrLf & _
-        "Errors: " & errorCount, _
-        vbInformation, _
-        "Data Update Completed"
-
-
-SafeExit:
-
-    '===========================================================================
-    ' RESTORE EXCEL SETTINGS
-    '===========================================================================
-
-    On Error Resume Next
-
-    If sourceWasOpened Then
-
-        wbSource.Close SaveChanges:=False
-
-    End If
-
-    Application.ScreenUpdating = oldScreenUpdating
-    Application.EnableEvents = oldEnableEvents
-    Application.DisplayAlerts = oldDisplayAlerts
-    Application.Calculation = oldCalculation
-
-    On Error GoTo 0
-
-    Exit Sub
-
-
-ErrorHandler:
-
-    MsgBox _
-        "An error occurred during DataUpdate." & vbCrLf & vbCrLf & _
-        "Error number: " & Err.Number & vbCrLf & _
-        "Description: " & Err.Description & vbCrLf & vbCrLf & _
-        "Processing Changes row: " & i, _
-        vbCritical, _
-        "DataUpdate Error"
-
-    Resume SafeExit
-
-End Sub
-
-
-'===============================================================================
-' PROCESS MODIFIED
-'
-' Changes contains NEW values.
-'
-' Find existing record using REQUEST + NUMBER.
-'
-' Then replace only the columns contained in Changes.
-'===============================================================================
-
-Private Function ProcessModified( _
-                    wsTarget As Worksheet, _
-                    wsChanges As Worksheet, _
-                    changesRow As Long, _
-                    requestColTarget As Long, _
-                    numberColTarget As Long, _
-                    requestColChanges As Long, _
-                    numberColChanges As Long) As Boolean
-
-    Dim requestValue As Variant
-    Dim numberValue As Variant
-
-    Dim targetRow As Long
-
-    Dim changesLastCol As Long
-
-    Dim changeCol As Long
-    Dim targetCol As Long
-
-    Dim headerName As String
-
-    On Error GoTo ErrorHandler
-
-
-    requestValue = wsChanges.Cells( _
-                            changesRow, _
-                            requestColChanges).value
-
-    numberValue = wsChanges.Cells( _
-                            changesRow, _
-                            numberColChanges).value
-
-
-    '-------------------------------------------------------------------------
-    ' Find existing record
-    '-------------------------------------------------------------------------
-
-    targetRow = FindRecordRow( _
-                    wsTarget, _
-                    HEADER_ROW, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestValue, _
-                    numberValue)
-
-
-    If targetRow = 0 Then
-
-        ProcessModified = False
-
-        Exit Function
-
-    End If
-
-
-    changesLastCol = LastUsedColumn(wsChanges)
-
-
-    '-------------------------------------------------------------------------
-    ' Update columns
-    '
-    ' Changes data begins at column C.
-    '
-    ' We use the header name to locate the corresponding target column.
-    '-------------------------------------------------------------------------
-
-    For changeCol = DATA_START_COL To changesLastCol
-
-        headerName = Trim$( _
-                        CStr( _
-                            wsChanges.Cells(1, changeCol).value _
-                        ) _
-                     )
-
-
-        ' Skip metadata columns
-        If StrComp(headerName, "Changed By", vbTextCompare) <> 0 _
-           And StrComp(headerName, "Time", vbTextCompare) <> 0 _
-           And StrComp(headerName, "Date", vbTextCompare) <> 0 Then
-
-
-            targetCol = FindHeaderColumn( _
-                            wsTarget, _
-                            HEADER_ROW, _
-                            headerName)
-
-
-            If targetCol > 0 Then
-
-                wsTarget.Cells( _
-                            targetRow, _
-                            targetCol).value = _
-                    wsChanges.Cells( _
-                            changesRow, _
-                            changeCol).value
-
-            End If
-
-        End If
-
-    Next changeCol
-
-
-    ProcessModified = True
-
-    Exit Function
-
-
-ErrorHandler:
-
-    ProcessModified = False
-
-End Function
-
-
-'===============================================================================
-' PROCESS ADDED
-'
-' Add a new record to the target sheet.
-'
-' Data is taken from Changes.
-'===============================================================================
-
-Private Function ProcessAdded( _
-                    wsTarget As Worksheet, _
-                    wsChanges As Worksheet, _
-                    changesRow As Long, _
-                    requestColTarget As Long, _
-                    numberColTarget As Long, _
-                    requestColChanges As Long, _
-                    numberColChanges As Long, _
-                    sourceLastCol As Long) As Boolean
-
-    Dim requestValue As Variant
-    Dim numberValue As Variant
-
-    Dim targetRow As Long
-
-    Dim changesLastCol As Long
-
-    Dim changeCol As Long
-    Dim targetCol As Long
-
-    Dim headerName As String
-
-    On Error GoTo ErrorHandler
-
-
-    requestValue = wsChanges.Cells( _
-                            changesRow, _
-                            requestColChanges).value
-
-    numberValue = wsChanges.Cells( _
-                            changesRow, _
-                            numberColChanges).value
-
-
-    '-------------------------------------------------------------------------
-    ' Check whether record already exists
-    '-------------------------------------------------------------------------
-
-    targetRow = FindRecordRow( _
-                    wsTarget, _
-                    HEADER_ROW, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestValue, _
-                    numberValue)
-
-
-    If targetRow > 0 Then
-
-        ' Record already exists.
-        ' Do not create duplicate.
-
-        ProcessAdded = False
-
-        Exit Function
-
-    End If
-
-
-    '-------------------------------------------------------------------------
-    ' Find next available row
-    '-------------------------------------------------------------------------
-
-    targetRow = LastUsedRow(wsTarget) + 1
-
-
-    changesLastCol = LastUsedColumn(wsChanges)
-
-
-    '-------------------------------------------------------------------------
-    ' Copy data according to column header
-    '-------------------------------------------------------------------------
-
-    For changeCol = DATA_START_COL To changesLastCol
-
-        headerName = Trim$( _
-                        CStr( _
-                            wsChanges.Cells(1, changeCol).value _
-                        ) _
-                     )
-
-
-        ' Skip metadata
-        If StrComp(headerName, "Changed By", vbTextCompare) <> 0 _
-           And StrComp(headerName, "Time", vbTextCompare) <> 0 _
-           And StrComp(headerName, "Date", vbTextCompare) <> 0 Then
-
-
-            targetCol = FindHeaderColumn( _
-                            wsTarget, _
-                            HEADER_ROW, _
-                            headerName)
-
-
-            If targetCol > 0 Then
-
-                wsTarget.Cells( _
-                            targetRow, _
-                            targetCol).value = _
-                    wsChanges.Cells( _
-                            changesRow, _
-                            changeCol).value
-
-            End If
-
-        End If
-
-    Next changeCol
-
-
-    ProcessAdded = True
-
-    Exit Function
-
-
-ErrorHandler:
-
-    ProcessAdded = False
-
-End Function
-
-
-'===============================================================================
-' PROCESS DELETED
-'
-' Find the record using REQUEST + NUMBER and delete that row.
-'===============================================================================
-
-Private Function ProcessDeleted( _
-                    wsTarget As Worksheet, _
-                    wsChanges As Worksheet, _
-                    changesRow As Long, _
-                    requestColTarget As Long, _
-                    numberColTarget As Long, _
-                    requestColChanges As Long, _
-                    numberColChanges As Long) As Boolean
-
-    Dim requestValue As Variant
-    Dim numberValue As Variant
-
-    Dim targetRow As Long
-
-    On Error GoTo ErrorHandler
-
-
-    requestValue = wsChanges.Cells( _
-                            changesRow, _
-                            requestColChanges).value
-
-    numberValue = wsChanges.Cells( _
-                            changesRow, _
-                            numberColChanges).value
-
-
-    '-------------------------------------------------------------------------
-    ' Find record
-    '-------------------------------------------------------------------------
-
-    targetRow = FindRecordRow( _
-                    wsTarget, _
-                    HEADER_ROW, _
-                    requestColTarget, _
-                    numberColTarget, _
-                    requestValue, _
-                    numberValue)
-
-
-    If targetRow = 0 Then
-
-        ProcessDeleted = False
-
-        Exit Function
-
-    End If
-
-
-    '-------------------------------------------------------------------------
-    ' Delete entire worksheet row
-    '-------------------------------------------------------------------------
-
-    wsTarget.Rows(targetRow).Delete Shift:=xlUp
-
-
-    ProcessDeleted = True
-
-    Exit Function
-
-
-ErrorHandler:
-
-    ProcessDeleted = False
-
-End Function
-
-
-'===============================================================================
-' FIND RECORD ROW
-'
-' Search by:
-'
-'     REQUEST + NUMBER
-'
-' Data starts after HEADER_ROW.
-'===============================================================================
-
-Private Function FindRecordRow( _
-                    ws As Worksheet, _
-                    headerRow As Long, _
-                    requestCol As Long, _
-                    numberCol As Long, _
-                    requestValue As Variant, _
-                    numberValue As Variant) As Long
-
-    Dim lastRow As Long
-    Dim r As Long
-
-    Dim requestText As String
-    Dim numberText As String
-
-    Dim currentRequest As String
-    Dim currentNumber As String
-
-    requestText = NormalizeKeyValue(requestValue)
-    numberText = NormalizeKeyValue(numberValue)
-
-    lastRow = LastUsedRow(ws)
-
-
-    If lastRow <= headerRow Then
-
-        FindRecordRow = 0
-
-        Exit Function
-
-    End If
-
-
-    For r = headerRow + 1 To lastRow
-
-        currentRequest = NormalizeKeyValue( _
-                            ws.Cells(r, requestCol).value)
-
-        currentNumber = NormalizeKeyValue( _
-                            ws.Cells(r, numberCol).value)
-
-
-        If StrComp(currentRequest, requestText, vbTextCompare) = 0 _
-           And StrComp(currentNumber, numberText, vbTextCompare) = 0 Then
-
-            FindRecordRow = r
-
-            Exit Function
-
-        End If
-
+        selected = selected + 1
+        action = UCase$(Trim$(SafeText(wc.Cells(r, TYPE_COL).Value2)))
+        req = wc.Cells(r, reqC).Value2
+        num = wc.Cells(r, numC).Value2
+
+        Select Case action
+            Case "MODIFIED", "MODIFY"
+                targetRow = FindRecord(ws, reqT, numT, req)
+                If targetRow = 0 Then
+                    errors = errors + 1
+                Else
+                    ' Replace every matching source-data field. Empty cells are intentionally copied.
+                    For c = DATA_START_COL To lastChangesCol
+                        hdr = Trim$(SafeText(wc.Cells(CHANGES_HEADER_ROW, c).Value2))
+                        If Len(hdr) > 0 And Not IsMetadata(hdr) Then
+                            destCol = HeaderCol(ws, HEADER_ROW, hdr)
+                            If destCol > 0 Then ws.Cells(targetRow, destCol).Value2 = wc.Cells(r, c).Value2
+                        End If
+                    Next c
+                    nMod = nMod + 1
+                End If
+
+            Case "ADDED", "ADD"
+                If FindRecord(ws, reqT, numT, req) > 0 Then
+                    errors = errors + 1  ' prevent accidental duplicate key
+                Else
+                    targetRow = LastRow(ws) + 1
+                    If targetRow <= HEADER_ROW Then targetRow = HEADER_ROW + 1
+                    For c = DATA_START_COL To lastChangesCol
+                        hdr = Trim$(SafeText(wc.Cells(CHANGES_HEADER_ROW, c).Value2))
+                        If Len(hdr) > 0 And Not IsMetadata(hdr) Then
+                            destCol = HeaderCol(ws, HEADER_ROW, hdr)
+                            If destCol > 0 Then ws.Cells(targetRow, destCol).Value2 = wc.Cells(r, c).Value2
+                        End If
+                    Next c
+                    nAdd = nAdd + 1
+                End If
+
+            Case "DELETED", "DELETE"
+                targetRow = FindRecord(ws, reqT, numT, req)
+                If targetRow = 0 Then
+                    errors = errors + 1
+                Else
+                    ws.Rows(targetRow).Delete
+                    nDel = nDel + 1
+                End If
+
+            Case Else
+                errors = errors + 1
+        End Select
+ContinueRow:
     Next r
 
+    MsgBox "DataUpdate completed." & vbCrLf & vbCrLf & _
+           "Selected YES: " & selected & vbCrLf & _
+           "Modified: " & nMod & vbCrLf & "Added: " & nAdd & vbCrLf & _
+           "Deleted: " & nDel & vbCrLf & "Skipped: " & skipped & vbCrLf & _
+           "Errors/not applied: " & errors, vbInformation, "DataUpdate"
 
-    FindRecordRow = 0
+CleanExit:
+    Application.ScreenUpdating = oldScreen
+    Application.EnableEvents = oldEvents
+    Application.DisplayAlerts = oldAlerts
+    Application.Calculation = oldCalc
+    Exit Sub
 
-End Function
+Fail:
+    MsgBox "DataUpdate stopped: " & Err.Description, vbCritical, "DataUpdate Error"
+    Resume CleanExit
+End Sub
 
-
-'===============================================================================
-' FIND HEADER COLUMN
-'===============================================================================
-
-Private Function FindHeaderColumn( _
-                    ws As Worksheet, _
-                    headerRow As Long, _
-                    headerName As String) As Long
-
-    Dim lastCol As Long
-    Dim c As Long
-
-    Dim currentHeader As String
-
-    lastCol = LastUsedColumn(ws)
-
-
-    For c = 1 To lastCol
-
-        currentHeader = Trim$( _
-                            CStr( _
-                                ws.Cells(headerRow, c).value _
-                            ) _
-                        )
-
-
-        If StrComp( _
-                currentHeader, _
-                Trim$(headerName), _
-                vbTextCompare) = 0 Then
-
-            FindHeaderColumn = c
-
+Private Function HeaderCol(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headerName As String) As Long
+    Dim c As Long, lc As Long, candidate As String
+    lc = LastCol(ws, rowNum)
+    For c = 1 To lc
+        candidate = Trim$(SafeText(ws.Cells(rowNum, c).Value2))
+        If StrComp(candidate, Trim$(headerName), vbTextCompare) = 0 Then
+            HeaderCol = c
             Exit Function
-
         End If
-
     Next c
-
-
-    FindHeaderColumn = 0
-
 End Function
 
+Private Function FindRecord(ByVal ws As Worksheet, ByVal reqCol As Long, ByVal numCol As Long, _
+                            ByVal reqValue As Variant) As Long
+    ' REQUEST + NUMBER key is passed as the two adjacent key values below.
+    ' Kept as a dedicated helper to make matching behavior consistent for all action types.
+    Dim r As Long, lr As Long
+    Dim reqKey As String, numKey As String
+    reqKey = NormalizeKey(reqValue)
+    ' NUMBER is supplied via module-level call wrapper in FindRecordByKey.
+    FindRecord = 0
+End Function
 
-'===============================================================================
-' LAST USED ROW
-'===============================================================================
+Private Function FindRecordByKey(ByVal ws As Worksheet, ByVal reqCol As Long, ByVal numCol As Long, _
+                                 ByVal reqValue As Variant, ByVal numValue As Variant) As Long
+    Dim r As Long, lr As Long
+    lr = LastRow(ws)
+    For r = HEADER_ROW + 1 To lr
+        If NormalizeKey(ws.Cells(r, reqCol).Value2) = NormalizeKey(reqValue) And _
+           NormalizeKey(ws.Cells(r, numCol).Value2) = NormalizeKey(numValue) Then
+            FindRecordByKey = r
+            Exit Function
+        End If
+    Next r
+End Function
 
-Private Function LastUsedRow(ws As Worksheet) As Long
-
-    Dim lastCell As Range
-
-    On Error Resume Next
-
-    Set lastCell = ws.Cells.Find( _
-                        What:="*", _
-                        After:=ws.Cells(1, 1), _
-                        LookIn:=xlFormulas, _
-                        LookAt:=xlPart, _
-                        SearchOrder:=xlByRows, _
-                        SearchDirection:=xlPrevious, _
-                        MatchCase:=False)
-
-    On Error GoTo 0
-
-
-    If lastCell Is Nothing Then
-
-        LastUsedRow = 1
-
+Private Function NormalizeKey(ByVal v As Variant) As String
+    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then
+        NormalizeKey = ""
     Else
-
-        LastUsedRow = lastCell.Row
-
+        NormalizeKey = Trim$(CStr(v))
     End If
-
 End Function
 
-
-'===============================================================================
-' LAST USED COLUMN
-'===============================================================================
-
-Private Function LastUsedColumn(ws As Worksheet) As Long
-
-    Dim lastCell As Range
-
-    On Error Resume Next
-
-    Set lastCell = ws.Cells.Find( _
-                        What:="*", _
-                        After:=ws.Cells(1, 1), _
-                        LookIn:=xlFormulas, _
-                        LookAt:=xlPart, _
-                        SearchOrder:=xlByColumns, _
-                        SearchDirection:=xlPrevious, _
-                        MatchCase:=False)
-
-    On Error GoTo 0
-
-
-    If lastCell Is Nothing Then
-
-        LastUsedColumn = 1
-
+Private Function SafeText(ByVal v As Variant) As String
+    If IsError(v) Or IsNull(v) Or IsEmpty(v) Then
+        SafeText = ""
     Else
-
-        LastUsedColumn = lastCell.Column
-
+        SafeText = CStr(v)
     End If
-
 End Function
 
-
-'===============================================================================
-' NORMALIZE KEY VALUE
-'
-' Used when comparing REQUEST / NUMBER.
-'===============================================================================
-
-Private Function NormalizeKeyValue(value As Variant) As String
-
-    If IsError(value) Then
-
-        NormalizeKeyValue = ""
-
-    ElseIf IsNull(value) Or IsEmpty(value) Then
-
-        NormalizeKeyValue = ""
-
-    Else
-
-        NormalizeKeyValue = Trim$(CStr(value))
-
-    End If
-
+Private Function IsMetadata(ByVal headerName As String) As Boolean
+    IsMetadata = (StrComp(headerName, "Changed By", vbTextCompare) = 0 Or _
+                  StrComp(headerName, "Time", vbTextCompare) = 0 Or _
+                  StrComp(headerName, "Date", vbTextCompare) = 0)
 End Function
 
+Private Function LastRow(ByVal ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, _
+                          LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    If f Is Nothing Then LastRow = 1 Else LastRow = f.Row
+End Function
 
-
+Private Function LastCol(ByVal ws As Worksheet, Optional ByVal rowNum As Long = 1) As Long
+    Dim f As Range
+    Set f = ws.Rows(rowNum).Find(What:="*", After:=ws.Cells(rowNum, 1), LookIn:=xlFormulas, _
+                                 LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
+    If f Is Nothing Then LastCol = 1 Else LastCol = f.Column
+End Function
